@@ -1,0 +1,85 @@
+name: CI Terraform
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  static_analysis:
+    name: 1. Análisis estático (TFLint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint -f compact
+
+  security_analysis:
+    name: 2. Análisis de seguridad (Checkov)
+    runs-on: ubuntu-latest
+    needs: static_analysis
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          soft_fail: false # Security gate must block on findings
+          framework: terraform
+
+  terraform_validation:
+    name: 3. Validación terraform (Validate & OPA)
+    runs-on: ubuntu-latest
+    needs: security_analysis
+    env:
+      AWS_ACCESS_KEY_ID: mock_key
+      AWS_SECRET_ACCESS_KEY: mock_secret
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Show JSON
+        run: terraform show -json tfplan > tfplan.json
+
+      - name: Run OPA Policy Evaluation
+        run: |
+          # Use --fail flag if supported or check if output is not empty/null
+          ssh_deny=$(opa eval --data policies/ssh_access.rego --input tfplan.json "data.terraform.ssh_access.deny" --format json)
+          type_deny=$(opa eval --data policies/instance_type.rego --input tfplan.json "data.terraform.instance_type.deny" --format json)
+
+          echo "SSH Access Deny: $ssh_deny"
+          echo "Instance Type Deny: $type_deny"
+
+          if [ "$(echo $ssh_deny | jq '.result[0].expressions[0].value | length')" -gt 0 ] || [ "$(echo $type_deny | jq '.result[0].expressions[0].value | length')" -gt 0 ]; then
+            echo "Policy violation detected. Failing build."
+            exit 1
+          fi
